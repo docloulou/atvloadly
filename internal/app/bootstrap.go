@@ -96,7 +96,7 @@ func InitDb(conf *Configuration) error {
 	if conf.Db.Path == "" {
 		conf.Db.Path = cfg.DefaultConfigDir()
 	}
-	if err := db.Open(conf.Db).AutoMigrate(&model.InstalledApp{}, &model.SigningIdentity{}); err != nil {
+	if err := db.Open(conf.Db).AutoMigrate(&model.InstalledApp{}, &model.SigningIdentity{}, &model.SavedSource{}); err != nil {
 		return err
 	}
 

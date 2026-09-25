@@ -114,7 +114,11 @@ func validateInstallRequest(v *model.InstalledApp) error {
 		if v.SigningIdentityID == 0 {
 			return fmt.Errorf("no signing identity selected")
 		}
-		if !isRemoteIPA(v.IpaPath) {
+		// Tracked sources install Apple ID signed builds only.
+		if v.Source.Tracked() {
+			return fmt.Errorf("a tracked source cannot be installed with an external signing certificate")
+		}
+		if !ipa.IsRemoteURL(v.IpaPath) {
 			resolved, err := ResolveClientIPAPath(v.IpaPath)
 			if err != nil {
 				return err
@@ -126,13 +130,22 @@ func validateInstallRequest(v *model.InstalledApp) error {
 	return nil
 }
 
-func isRemoteIPA(path string) bool {
-	return strings.HasPrefix(path, "http:") || strings.HasPrefix(path, "https:")
-}
-
 func runInstallMessage(mgr *manager.WebsocketManager, installMgr *manager.InstallManager, v model.InstalledApp, dev *model.Device) {
+	if v.Source.Tracked() {
+		mgr.WriteMessage("Resolving build from source...\n")
+		if err := ResolveSourceInstall(&v); err != nil {
+			mgr.WriteMessage(fmt.Sprintf("ERROR: %s", err.Error()))
+			mgr.WriteMessage("\n")
+			mgr.WriteMessage("Installation Failed!")
+			return
+		}
+	} else {
+		// Only the server writes source data.
+		v.Source = model.AppSource{}
+	}
+
 	ipaPath := v.IpaPath
-	if isRemoteIPA(ipaPath) {
+	if ipa.IsRemoteURL(ipaPath) {
 		mgr.WriteMessage("Downloading IPA from URL...\n")
 		lastPct := int64(-1)
 		result, err := ipa.DownloadAndParse(ipaPath, func(downloaded, total int64) {
@@ -158,6 +171,13 @@ func runInstallMessage(mgr *manager.WebsocketManager, installMgr *manager.Instal
 			defer func() { _ = os.Remove(result.IconPath) }()
 		}
 		mgr.WriteMessage("Download complete!\n")
+
+		if err := ipa.CheckPlatform(result.Platforms, dev.DeviceClass); err != nil {
+			mgr.WriteMessage(fmt.Sprintf("ERROR: %s", err.Error()))
+			mgr.WriteMessage("\n")
+			mgr.WriteMessage("Installation Failed!")
+			return
+		}
 
 		v.IpaPath = result.LocalPath
 		v.IpaName = result.Name

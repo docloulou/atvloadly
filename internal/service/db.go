@@ -89,6 +89,7 @@ func SaveApp(app model.InstalledApp) (*model.InstalledApp, error) {
 		app.ID = cur.ID
 
 		now := time.Now()
+		cur.IpaName = app.IpaName
 		cur.IpaPath = app.IpaPath
 		cur.Version = app.Version
 		cur.RefreshedDate = &now
@@ -102,6 +103,9 @@ func SaveApp(app model.InstalledApp) (*model.InstalledApp, error) {
 		cur.SignedBundleIdentifier = app.SignedBundleIdentifier
 		cur.CustomIdentifier = app.CustomIdentifier
 		cur.AllowMissingEntitlements = app.AllowMissingEntitlements
+		// The source link describes how the app was last installed: installing
+		// from a file or URL stops tracking.
+		cur.Source = app.Source
 
 		// 把 ipa/icon 移动到 ipa 保存目录
 		saveDir := filepath.Join(conf.Config.Server.DataDir, "ipa", fmt.Sprintf("%d", app.ID))
@@ -116,6 +120,7 @@ func SaveApp(app model.InstalledApp) (*model.InstalledApp, error) {
 		cur.Icon = storeAppIcon(app.Icon, saveDir, cur.Icon)
 
 		updateData := map[string]any{
+			"ipa_name":                   cur.IpaName,
 			"ipa_path":                   cur.IpaPath,
 			"icon":                       cur.Icon,
 			"version":                    cur.Version,
@@ -137,10 +142,11 @@ func SaveApp(app model.InstalledApp) (*model.InstalledApp, error) {
 			updateData["remove_extensions"] = cur.RemoveExtensions
 			// The record is keyed by the app on the device, which another IPA
 			// can replace when it is installed under the same identifier.
-			cur.IpaName = app.IpaName
 			cur.BundleIdentifier = app.BundleIdentifier
-			updateData["ipa_name"] = cur.IpaName
 			updateData["bundle_identifier"] = cur.BundleIdentifier
+		}
+		for k, v := range sourceColumns(cur.Source) {
+			updateData[k] = v
 		}
 		if result := db.Store().Model(&cur).Updates(updateData); result.Error != nil {
 			return nil, result.Error

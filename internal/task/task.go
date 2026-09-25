@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,7 @@ type BatchInfo struct {
 	TotalCount   int
 	SuccessCount int
 	FailedApps   []FailedAppInfo
+	UpdatedApps  []string // localized "updated to" lines of successful source updates
 	Notify       bool
 }
 
@@ -70,11 +72,25 @@ func (t *Task) RunSchedule() error {
 		t.Stop()
 	}
 
-	t.c = cron.New()
-	if _, err := t.c.AddFunc(app.Settings.Task.CrodTime, t.Run); err != nil {
+	if _, err := cron.ParseStandard(app.Settings.Task.CrodTime); err != nil {
 		log.Err(err).Msgf("Failed to start app refresh scheduled task due to incorrect timing format: %s", app.Settings.Task.CrodTime)
-		t.c = nil
 		return err
+	}
+
+	// Recover keeps a panicking job (a refresh or an update check) from
+	// taking the whole service down.
+	t.c = cron.New(cron.WithChain(cron.Recover(cron.DefaultLogger)))
+	if app.Settings.Task.Enabled {
+		if _, err := t.c.AddFunc(app.Settings.Task.CrodTime, t.Run); err != nil {
+			t.c = nil
+			return err
+		}
+	}
+	if hours := app.Settings.Update.CheckInterval; hours > 0 {
+		if _, err := t.c.AddFunc(updateCheckSpec(hours), t.CheckUpdates); err != nil {
+			t.c = nil
+			return err
+		}
 	}
 
 	t.Start()
@@ -85,10 +101,13 @@ func (t *Task) RunSchedule() error {
 func (t *Task) Start() {
 	if app.Settings.Task.Enabled {
 		log.Infof("App refresh scheduled task has started, time: %s", app.Settings.Task.CrodTime)
-		t.c.Start()
 	} else {
 		log.Warn("App refresh scheduled task is disabled.")
 	}
+	if hours := app.Settings.Update.CheckInterval; hours > 0 {
+		log.Infof("App update check scheduled task has started, time: %s", updateCheckSpec(hours))
+	}
+	t.c.Start()
 
 	// Register device connection callback to automatically refresh the application when the device is connected
 	manager.SetDeviceConnectedCallback(func(device model.Device) {
@@ -113,8 +132,25 @@ func (t *Task) Run() {
 		return
 	}
 
+	res := service.CheckSourceUpdates(installedApps)
+	sendSourceNotices(res.Notices)
+	updates := make(map[uint]model.InstalledApp, len(res.Updates))
+	for _, target := range res.Updates {
+		updates[target.ID] = target
+	}
+
 	appsNeedRefresh := make([]model.InstalledApp, 0)
-	for _, v := range t.autoRefreshApps(installedApps) {
+	// An update re-signs the app, so it replaces the refresh.
+	notUpdated := make([]model.InstalledApp, 0, len(installedApps))
+	for _, v := range installedApps {
+		if target, ok := updates[v.ID]; ok && v.Source.AutoUpdate && target.Source.BuildID != v.Source.FailedBuildID && canInstallUpdate(v) {
+			appsNeedRefresh = append(appsNeedRefresh, target)
+			continue
+		}
+		notUpdated = append(notUpdated, v)
+	}
+	updateCount := len(appsNeedRefresh)
+	for _, v := range t.autoRefreshApps(notUpdated) {
 		// iPhone cannot refresh on a schedule and relies on whether the phone is unlocked
 		// Need to check Afc service status before refreshing
 		if v.IsIPhoneApp() {
@@ -131,42 +167,59 @@ func (t *Task) Run() {
 		return
 	}
 
-	log.Infof("Start executing installation task (%d need refresh)...", len(appsNeedRefresh))
+	log.Infof("Start executing installation task (%d need refresh, %d need update)...", len(appsNeedRefresh)-updateCount, updateCount)
 	t.StartInstallApps(appsNeedRefresh, true)
 }
 
-func (t *Task) StartInstallApps(apps []model.InstalledApp, notify bool) {
+// StartInstallApps queues apps for installation and returns how many were
+// queued; apps already installing are skipped.
+func (t *Task) StartInstallApps(apps []model.InstalledApp, notify bool) int {
 	t.resetInvalidAccounts()
 
 	if len(apps) == 0 {
-		return
+		return 0
 	}
 
-	// Create a batch for aggregated notification
+	// Create a batch for aggregated notification. batchMu is held while
+	// queueing so that no queued app finishes before its batch is current.
 	batchID := fmt.Sprintf("batch-%d", time.Now().UnixNano())
 	t.batchMu.Lock()
-	t.currentBatch = &BatchInfo{
-		ID:           batchID,
-		TotalCount:   len(apps),
-		SuccessCount: 0,
-		FailedApps:   make([]FailedAppInfo, 0),
-		Notify:       notify,
-	}
-	t.batchMu.Unlock()
+	defer t.batchMu.Unlock()
 
+	queued := 0
 	for _, v := range apps {
-		t.startInstallAppInternal(v, notify, batchID)
+		if t.startInstallAppInternal(v, notify, batchID) {
+			queued++
+		}
 	}
+
+	// The batch only waits for the queued apps. When none was queued (they
+	// are already installing), the batch in flight stays current so that its
+	// notification is still sent.
+	if queued > 0 {
+		t.currentBatch = &BatchInfo{
+			ID:           batchID,
+			TotalCount:   queued,
+			SuccessCount: 0,
+			FailedApps:   make([]FailedAppInfo, 0),
+			Notify:       notify,
+		}
+	}
+
+	return queued
 }
 
-func (t *Task) startInstallAppInternal(v model.InstalledApp, notify bool, batchID string) {
-	if _, loaded := t.InstallingApps.LoadOrStore(v.ID, v); !loaded {
-		select {
-		case t.InstallAppQueue <- TaskItem{App: v, Notify: notify, BatchID: batchID}:
-		default:
-			t.InstallingApps.Delete(v.ID)
-			log.Warnf("The install queue is full, skip task: %s", v.IpaName)
-		}
+func (t *Task) startInstallAppInternal(v model.InstalledApp, notify bool, batchID string) bool {
+	if _, loaded := t.InstallingApps.LoadOrStore(v.ID, v); loaded {
+		return false
+	}
+	select {
+	case t.InstallAppQueue <- TaskItem{App: v, Notify: notify, BatchID: batchID}:
+		return true
+	default:
+		t.InstallingApps.Delete(v.ID)
+		log.Warnf("The install queue is full, skip task: %s", v.IpaName)
+		return false
 	}
 }
 
@@ -190,6 +243,10 @@ func (t *Task) runQueue() {
 }
 
 func (t *Task) tryInstallApp(item TaskItem) {
+	// Decide before resolveIPA replaces a remote IpaPath with the downloaded file.
+	refresh := shouldUseRefreshMode(item.App)
+	update := isSourceUpdate(item.App)
+
 	resolvedApp, err := t.resolveIPA(item.App)
 	if err != nil {
 		log.Err(err).Msgf("Prepare ipa path failed: %s", item.App.IpaName)
@@ -197,10 +254,11 @@ func (t *Task) tryInstallApp(item TaskItem) {
 		return
 	}
 	v := *resolvedApp
-	// The upload files of a new installation, before SaveApp moves them. A
-	// reinstallation uses the files of its record, which must stay.
+	// The downloaded or uploaded files of a new installation or an update,
+	// before SaveApp moves them. A reinstallation uses the files of its record,
+	// which must stay.
 	var uploadedIPA, uploadedIcon string
-	if v.ID == 0 {
+	if v.ID == 0 || update {
 		uploadedIPA, uploadedIcon = v.IpaPath, v.Icon
 	}
 
@@ -216,7 +274,7 @@ func (t *Task) tryInstallApp(item TaskItem) {
 		}
 		installMgr.Close()
 	}()
-	result, err := t.runInternal(v, installMgr)
+	result, err := t.runInternal(v, refresh, installMgr)
 
 	success := err == nil
 	if success {
@@ -229,7 +287,7 @@ func (t *Task) tryInstallApp(item TaskItem) {
 		v.RefreshedError = model.RefreshedErrorNone
 		v.SignedBundleIdentifier = result.SignedBundleIdentifier
 
-		if v.ID == 0 {
+		if v.ID == 0 || update {
 			savedApp, saveErr := service.SaveApp(v)
 			if saveErr != nil {
 				log.Err(saveErr).Msgf("Save app failed after installation success: %s", v.IpaName)
@@ -257,7 +315,16 @@ func (t *Task) handleInstallFailure(item TaskItem, v model.InstalledApp, err err
 	log.Err(err).Msgf("Installing ipa failed: %s", v.IpaName)
 	v.RefreshedResult = false
 	v.RefreshedError = service.RefreshedErrorOf(err)
-	if v.ID != 0 {
+	if isSourceUpdate(item.App) {
+		// The installed app is unchanged: only remember the failed build, and
+		// an invalid account so that refreshes skip it.
+		if markErr := service.MarkSourceUpdateFailed(item.App.ID, item.App.Source.BuildID, err.Error()); markErr != nil {
+			log.Err(markErr).Msgf("Save update failure failed: %s", v.IpaName)
+		}
+		if v.RefreshedError == model.RefreshedErrorInvalidAccount {
+			_ = service.UpdateAppRefreshResult(v)
+		}
+	} else if v.ID != 0 {
 		_ = service.UpdateAppRefreshResult(v)
 	}
 
@@ -266,33 +333,54 @@ func (t *Task) handleInstallFailure(item TaskItem, v model.InstalledApp, err err
 }
 
 func (t *Task) resolveIPA(v model.InstalledApp) (*model.InstalledApp, error) {
-	// Not new install, return directly to avoid unnecessary download
-	if v.ID != 0 {
+	remote := ipa.IsRemoteURL(v.IpaPath)
+	// A refresh re-uses the stored IPA, return directly to avoid unnecessary download
+	if v.ID != 0 && !remote {
 		return &v, nil
 	}
 
-	if strings.HasPrefix(v.IpaPath, "http:") || strings.HasPrefix(v.IpaPath, "https:") {
-		result, err := ipa.DownloadAndParse(v.IpaPath, nil)
+	var result *ipa.DownloadResult
+	var err error
+	if remote {
+		result, err = ipa.DownloadAndParse(v.IpaPath, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download ipa: %w", err)
 		}
-		v.IpaPath = result.LocalPath
-		v.IpaName = result.Name
-		v.BundleIdentifier = result.BundleIdentifier
-		v.Version = result.Version
-		v.Icon = result.IconPath
 	} else {
-		result, err := ipa.ParseLocalIPA(v.IpaPath)
+		result, err = ipa.ParseLocalIPA(v.IpaPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse ipa file: %w", err)
 		}
-		v.IpaName = result.Name
-		v.BundleIdentifier = result.BundleIdentifier
-		v.Version = result.Version
-		v.Icon = result.IconPath
 	}
 
+	if err := verifyIPA(v, result); err != nil {
+		if remote {
+			_ = os.Remove(result.LocalPath)
+		}
+		if result.IconPath != "" {
+			_ = os.Remove(result.IconPath)
+		}
+		return nil, err
+	}
+
+	v.IpaPath = result.LocalPath
+	v.IpaName = result.Name
+	v.BundleIdentifier = result.BundleIdentifier
+	v.Version = result.Version
+	v.Icon = result.IconPath
 	return &v, nil
+}
+
+// verifyIPA checks that the IPA can be installed as v: it must run on the
+// device, and an update must keep the bundle identifier of the installed app.
+func verifyIPA(v model.InstalledApp, result *ipa.DownloadResult) error {
+	if err := ipa.CheckPlatform(result.Platforms, v.DeviceClass); err != nil {
+		return err
+	}
+	if v.ID != 0 && result.BundleIdentifier != v.BundleIdentifier {
+		return fmt.Errorf("bundle identifier changed from %s to %s; install it as a new app", v.BundleIdentifier, result.BundleIdentifier)
+	}
+	return nil
 }
 
 func (t *Task) trackBatchProgress(item TaskItem, success bool, err error) {
@@ -305,6 +393,12 @@ func (t *Task) trackBatchProgress(item TaskItem, success bool, err error) {
 
 	if success {
 		t.currentBatch.SuccessCount++
+		if isSourceUpdate(item.App) {
+			t.currentBatch.UpdatedApps = append(t.currentBatch.UpdatedApps, i18n.LocalizeF("notify.update_installed", map[string]any{
+				"name":    item.App.DisplayName(),
+				"version": item.App.Source.Version,
+			}))
+		}
 	} else {
 		t.currentBatch.FailedApps = append(t.currentBatch.FailedApps, FailedAppInfo{
 			AppName: item.App.IpaName,
@@ -313,7 +407,12 @@ func (t *Task) trackBatchProgress(item TaskItem, success bool, err error) {
 		})
 	}
 
-	// Check if batch is complete
+	t.completeBatchIfDone()
+}
+
+// completeBatchIfDone sends the notification of the current batch and clears
+// it once every queued app is done. batchMu must be held.
+func (t *Task) completeBatchIfDone() {
 	completedCount := t.currentBatch.SuccessCount + len(t.currentBatch.FailedApps)
 	if completedCount >= t.currentBatch.TotalCount {
 		// Batch complete, send aggregated notification
@@ -336,6 +435,10 @@ func (t *Task) sendBatchNotification(batch *BatchInfo) {
 		title := i18n.LocalizeF("notify.batch_title", map[string]any{})
 		_ = notify.Send(title, message.String())
 	}
+
+	if len(batch.UpdatedApps) > 0 {
+		_ = notify.Send(i18n.Localize("notify.update_installed_title"), strings.Join(batch.UpdatedApps, ""))
+	}
 }
 
 // installResult is what a successful installation records on the app.
@@ -345,11 +448,10 @@ type installResult struct {
 	SignedBundleIdentifier string
 }
 
-func (t *Task) runInternal(v model.InstalledApp, installMgr *manager.InstallManager) (*installResult, error) {
+func (t *Task) runInternal(v model.InstalledApp, refresh bool, installMgr *manager.InstallManager) (*installResult, error) {
 	if v.IsExternalSigning() {
 		return t.runExternal(v, installMgr)
 	}
-
 	if v.Account == "" || v.UDID == "" {
 		installMgr.WriteLog("account or UDID is empty")
 		return nil, fmt.Errorf("%s", "account or UDID is empty")
@@ -374,7 +476,7 @@ func (t *Task) runInternal(v model.InstalledApp, installMgr *manager.InstallMana
 		IpaPath:          v.IpaPath,
 		CustomName:       v.CustomName,
 		RemoveExtensions: v.RemoveExtensions,
-		RefreshMode:      shouldUseRefreshMode(v),
+		RefreshMode:      refresh,
 	})
 	if err != nil {
 		installMgr.WriteLog(err.Error())
@@ -421,8 +523,16 @@ func (t *Task) runExternal(v model.InstalledApp, installMgr *manager.InstallMana
 	}, nil
 }
 
+// shouldUseRefreshMode reports whether v is a refresh of an installed app,
+// which re-uses its stored IPA and only renews the provisioning profiles.
 func shouldUseRefreshMode(v model.InstalledApp) bool {
-	return v.ID != 0
+	return v.ID != 0 && !ipa.IsRemoteURL(v.IpaPath)
+}
+
+// isSourceUpdate reports whether v installs a new build of an installed app
+// (see service.ApplyBuild), which must be signed again.
+func isSourceUpdate(v model.InstalledApp) bool {
+	return v.ID != 0 && ipa.IsRemoteURL(v.IpaPath)
 }
 
 // failureDescription is the notification text of an installation failure.
@@ -536,8 +646,9 @@ func RefreshApp(v model.InstalledApp) {
 	instance.StartInstallApps([]model.InstalledApp{v}, true)
 }
 
-func StartInstallApps(apps []model.InstalledApp, notify bool) {
-	instance.StartInstallApps(apps, notify)
+// StartInstallApps queues apps for installation and returns how many were queued.
+func StartInstallApps(apps []model.InstalledApp, notify bool) int {
+	return instance.StartInstallApps(apps, notify)
 }
 
 func GetCurrentInstallingApps() []model.InstalledApp {
@@ -548,6 +659,16 @@ func GetCurrentInstallingApps() []model.InstalledApp {
 		return true
 	})
 	return installingApps
+}
+
+// IsInstalling reports whether app id is queued or installing.
+func IsInstalling(id uint) bool {
+	return instance.isInstalling(id)
+}
+
+func (t *Task) isInstalling(id uint) bool {
+	_, ok := t.InstallingApps.Load(id)
+	return ok
 }
 
 func ReloadTask() error {

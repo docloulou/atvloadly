@@ -30,6 +30,7 @@ type InstalledApp struct {
 	RemoveExtensions bool           `json:"remove_extensions"`
 	CustomName       string         `json:"custom_name,omitempty"`
 	Enabled          bool           `json:"enabled,omitempty"`
+	Source           AppSource      `gorm:"embedded;embeddedPrefix:source_" json:"source"`
 
 	// SigningMode is empty for records created before signing modes existed;
 	// use EffectiveSigningMode to read it.
@@ -87,6 +88,14 @@ func (t InstalledApp) MarshalJSON() ([]byte, error) {
 		Password:    "",
 		SigningMode: t.EffectiveSigningMode(),
 	})
+}
+
+// DisplayName returns the custom name of the app, or its IPA name.
+func (t InstalledApp) DisplayName() string {
+	if t.CustomName != "" {
+		return t.CustomName
+	}
+	return t.IpaName
 }
 
 func (t InstalledApp) MaskAccount() string {

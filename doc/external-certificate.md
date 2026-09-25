@@ -212,6 +212,12 @@ Reinstalling one re-signs it with the same certificate and profile: it does
 **not** extend its validity. To extend it, replace the profile with a newer one
 (or import a new certificate and profile) and then reinstall the app.
 
+External certificate installations read an IPA file uploaded on the install
+page: the IPA URL and source modes are Apple ID only. For the same reason,
+these apps cannot track a source (GitHub releases or AltStore): their updates
+would otherwise be signed and installed unattended with the certificate.
+Install a new build manually instead.
+
 ## Deployment key
 
 The private keys of the imported identities are stored encrypted (AES-256-GCM)
