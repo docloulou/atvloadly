@@ -1,10 +1,16 @@
 <template>
   <div class="max-w-screen-md mx-auto flex flex-col gap-y-6 atv-install-page">
-    <div class="alert atv-warning">
+    <div class="alert atv-warning" v-if="!isExternal">
       <div class="w-8">
         <WarningIcon />
       </div>
       <span class="text-sm">{{ $t("install.tips.warning") }}</span>
+    </div>
+    <div class="alert atv-warning" v-else>
+      <div class="w-8">
+        <WarningIcon />
+      </div>
+      <span class="text-sm">{{ $t("install.tips.external") }}</span>
     </div>
 
     <div class="card atv-install-card">
@@ -36,6 +42,31 @@
           <form id="form" class="flex flex-col gap-y-4">
             <div class="form-control w-full">
               <label class="label">
+                <span class="label-text">{{ $t("install.form.signing_mode.label") }}</span>
+              </label>
+              <div
+                class="join w-full atv-install-signing-mode"
+                role="radiogroup"
+                :aria-label="$t('install.form.signing_mode.label')"
+              >
+                <button
+                  v-for="mode in signingModes"
+                  :key="mode"
+                  type="button"
+                  role="radio"
+                  class="btn join-item flex-1"
+                  :class="{ 'btn-primary': signing.mode === mode }"
+                  :aria-checked="signing.mode === mode"
+                  :disabled="loading"
+                  @click="setSigningMode(mode)"
+                >
+                  {{ $t(`signing.mode.${mode}`) }}
+                </button>
+              </div>
+            </div>
+
+            <div class="form-control w-full">
+              <label class="label">
                 <span class="label-text">
                   <template v-if="installMode === 'file'">{{ $t("install.form.choose_ipa.label") }}</template>
                   <template v-else>{{ $t("install.form.ipa_url.label") }}</template>
@@ -60,6 +91,8 @@
                 />
                 <button class="btn join-item"
                   @click.prevent="toggleInstallMode"
+                  :disabled="isExternal"
+                  :title="isExternal ? $t('install.form.ipa_url.external_unavailable') : undefined"
                   :aria-label="installMode === 'file'
                     ? $t('install.form.ipa_url.label')
                     : $t('install.form.choose_ipa.label')">
@@ -74,7 +107,7 @@
               </div>
             </div>
 
-            <div class="form-control w-full">
+            <div class="form-control w-full" v-if="!isExternal">
               <label class="label">
                 <span class="label-text">{{
                   $t("install.form.account.label")
@@ -115,6 +148,50 @@
               </label>
             </div>
 
+            <div class="form-control w-full" v-if="isExternal">
+              <label class="label">
+                <span class="label-text">{{ $t("install.form.identity.label") }}</span>
+              </label>
+              <div class="join w-full atv-install-account-picker">
+                <select
+                  class="select select-bordered join-item flex-1 min-w-0"
+                  v-model="signing.identityId"
+                  required
+                >
+                  <option value="" disabled>
+                    {{ $t("install.form.identity.placeholder") }}
+                  </option>
+                  <option
+                    v-for="identity in signing.identities"
+                    :key="identity.id"
+                    :value="identity.id"
+                  >
+                    {{ identity.name }}
+                    ({{ identity.id === recommendedIdentityId
+                      ? $t("install.form.account.last_used")
+                      : $t("install.form.identity.expires", { date: formatDate(identity.expires_at) }) }})
+                  </option>
+                </select>
+                <button
+                  class="btn join-item"
+                  :title="$t('install.form.identity.manage')"
+                  :aria-label="$t('install.form.identity.manage')"
+                  @click.prevent="manageIdentities"
+                >
+                  <div class="w-6 h-6">
+                    <SettingsIcon />
+                  </div>
+                </button>
+              </div>
+              <label class="label">
+                <span class="label-text-alt block whitespace-normal break-words">{{
+                  signing.identities.length > 0
+                    ? $t("install.form.identity.alt")
+                    : $t("install.form.identity.empty")
+                }}</span>
+              </label>
+            </div>
+
             <div class="form-control">
               <label class="label">
                 <span class="label-text">{{ $t("install.form.custom_name.label") }}</span>
@@ -131,13 +208,38 @@
               />
             </div>
 
+            <div class="form-control" v-if="isExternal">
+              <label class="label" for="install-custom-identifier">
+                <span class="label-text">{{ $t("install.form.custom_identifier.label") }}</span>
+              </label>
+              <input
+                id="install-custom-identifier"
+                type="text"
+                class="input input-bordered w-full"
+                maxlength="255"
+                autocapitalize="off"
+                autocomplete="off"
+                spellcheck="false"
+                :disabled="loading"
+                :placeholder="customIdentifierPlaceholder"
+                v-model.lazy.trim="form.custom_identifier"
+              />
+              <label class="label" for="install-custom-identifier">
+                <span class="label-text-alt block whitespace-normal break-words">{{
+                  $t("install.form.custom_identifier.alt")
+                }}</span>
+              </label>
+            </div>
+
             <div class="form-control">
               <label class="label cursor-pointer justify-between items-center gap-x-4">
                 <div class="flex items-center">
                   <span class="label-text">{{
                     $t("install.form.extensions.remove_extensions")
                   }}</span>
-                  <div class="tooltip" :data-tip="$t('install.form.extensions.tips')">
+                  <div class="tooltip" :data-tip="isExternal
+                    ? $t('install.form.extensions.tips_external')
+                    : $t('install.form.extensions.tips')">
                     <div class="w-4 h-4 text-secondary-content"><HelpIcon /></div>
                   </div>
                 </div>
@@ -149,7 +251,58 @@
               </label>
             </div>
 
+            <div class="form-control" v-if="showAllowMissingEntitlements">
+              <label class="label cursor-pointer justify-between items-center gap-x-4">
+                <div class="flex items-center">
+                  <span class="label-text">{{
+                    $t("install.form.allow_missing_entitlements.label")
+                  }}</span>
+                  <div class="tooltip" :data-tip="$t('install.form.allow_missing_entitlements.tips')">
+                    <div class="w-4 h-4 text-secondary-content"><HelpIcon /></div>
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  class="toggle toggle-warning"
+                  :disabled="loading"
+                  v-model="signing.allowMissingEntitlements"
+                />
+              </label>
+            </div>
+
           </form>
+
+          <section v-if="isExternal" class="atv-install-plan" aria-live="polite">
+            <div class="atv-install-plan-header">
+              <h5>{{ $t("signing.plan.title") }}</h5>
+              <button
+                v-if="canRerunCheck"
+                type="button"
+                class="btn btn-sm btn-ghost"
+                @click="rerunCheck"
+              >
+                {{ $t("signing.plan.run_check") }}
+              </button>
+            </div>
+            <div v-if="signing.uploading" class="atv-install-plan-progress">
+              <span class="loading loading-spinner loading-sm"></span>
+              {{ $t("signing.plan.uploading") }}
+            </div>
+            <div v-else-if="signing.checking" class="atv-install-plan-progress">
+              <span class="loading loading-spinner loading-sm"></span>
+              {{ $t("signing.plan.checking") }}
+            </div>
+            <div v-else-if="signing.checkError" class="atv-install-plan-error" role="alert">
+              <div class="font-semibold">{{ $t("signing.plan.check_failed") }}</div>
+              <div>{{ codeText(signing.checkError.code, signing.checkError.message) }}</div>
+              <SigningIssueList
+                v-if="signing.checkError.issues.length"
+                :issues="signing.checkError.issues"
+              />
+            </div>
+            <SigningPlan v-else-if="checkSummary" :summary="checkSummary" />
+            <p v-else class="atv-install-plan-hint">{{ $t(planHintKey) }}</p>
+          </section>
 
           <div class="flex flex-row gap-x-4">
             <button class="btn flex-1" @click="goBack">
@@ -158,7 +311,7 @@
             <button
               class="btn btn-primary flex-1"
               @click="onSubmit"
-              :disabled="loading"
+              :disabled="loading || !canInstall"
             >
               <span class="loading loading-spinner" v-show="loading"></span
               >{{ $t("install.form.button.submit") }}
@@ -169,6 +322,30 @@
 
       <Login ref="loginModal" @success="fetchData" />
     </div>
+
+    <section
+      v-if="report.plan || report.failure || report.verified"
+      class="card atv-install-report"
+      aria-live="polite"
+    >
+      <h5>{{ $t("signing.report.title") }}</h5>
+      <div v-if="report.failure" class="atv-install-plan-error" role="alert">
+        <span v-if="report.failure.class" class="atv-status atv-status--invalid self-start">
+          {{ classText(report.failure.class) }}
+        </span>
+        <div class="font-semibold">
+          {{ codeText(report.failure.code, report.failure.message) }}
+        </div>
+        <SigningIssueList v-if="report.failure.issues.length" :issues="report.failure.issues" />
+      </div>
+      <div v-if="report.verified" class="atv-status atv-status--valid self-start">
+        {{ $t("signing.report.verified") }}
+      </div>
+      <details v-if="report.plan" :open="report.plan.blocking">
+        <summary>{{ $t("signing.report.plan") }}</summary>
+        <SigningPlan class="mt-3" :summary="report.plan" />
+      </details>
+    </section>
 
     <div v-show="log.show">
       <textarea
@@ -247,15 +424,28 @@
   
   <script>
 import api from "@/api/api";
+import dayjs from "dayjs";
 import { toast } from "vue3-toastify";
 import { parseBundleIdFromPlist } from "@/utils/utils";
 import { installFailureMessage as formatInstallFailureMessage } from "@/utils/install-error-feedback.mjs";
 import { accountStatusLabel as formatAccountStatus } from "@/utils/install-feedback.mjs";
+import {
+  createSigningReportStream,
+  hasWaivableEntitlementIssues,
+  requestErrorOf,
+  signingCodeText,
+  summarizePlan,
+} from "@/utils/signing-report.mjs";
 import JSZip from "jszip";
 import Login from "@/components/Login.vue";
+import SigningIssueList from "@/components/SigningIssueList.vue";
+import SigningPlan from "@/components/SigningPlan.vue";
+
+const appleIDMode = "apple_id";
+const externalMode = "external_certificate";
 
 export default {
-  components: { Login },
+  components: { Login, SigningIssueList, SigningPlan },
   data() {
     return {
       id: "",
@@ -268,11 +458,39 @@ export default {
       accounts: [],
       installedApps: [],
       recommendedAccount: "",
+      recommendedIdentityId: 0,
+      signingModes: [appleIDMode, externalMode],
+      signing: {
+        mode: appleIDMode,
+        // Set once the user picks a mode; stops the automatic default.
+        modeChosen: false,
+        identities: [],
+        identityId: "",
+        allowMissingEntitlements: false,
+        // IPA uploaded ahead of time so the compatibility check can read it.
+        uploaded: null,
+        uploading: false,
+        checking: false,
+        check: null,
+        checkError: null,
+      },
+      // Structured SIGNING_REPORT stages of the running installation.
+      report: {
+        plan: null,
+        failure: null,
+        verified: false,
+      },
+      // Signing mode of the running installation.
+      submittedMode: "",
       form: {
         account: "",
         password: "",
         custom_name: "",
         remove_extensions: false,
+        // Main bundle identifier of the signed app (external mode); empty
+        // keeps the identifiers of the IPA. Synced on change, not on input,
+        // so that the compatibility check runs once per edit.
+        custom_identifier: "",
       },
       log: {
         newcontent : "",
@@ -290,8 +508,73 @@ export default {
       },
     };
   },
+  computed: {
+    isExternal() {
+      return this.signing.mode === externalMode;
+    },
+    checkSummary() {
+      const check = this.signing.check;
+      return check ? summarizePlan(check.plan, check.blocking) : null;
+    },
+    customIdentifierPlaceholder() {
+      return this.signing.uploaded?.bundle_identifier ||
+        this.signing.check?.plan?.main_bundle_id ||
+        this.$t("install.form.custom_identifier.placeholder");
+    },
+    showAllowMissingEntitlements() {
+      return this.isExternal && (
+        this.signing.allowMissingEntitlements ||
+        hasWaivableEntitlementIssues(this.signing.check?.plan?.issues)
+      );
+    },
+    canInstall() {
+      if (!this.isExternal) {
+        return true;
+      }
+      const signing = this.signing;
+      return !!(
+        signing.uploaded &&
+        signing.identityId &&
+        this.checkSummary &&
+        !this.checkSummary.blocking &&
+        !signing.uploading &&
+        !signing.checking
+      );
+    },
+    canRerunCheck() {
+      const signing = this.signing;
+      return this.isExternal && !this.loading && !signing.uploading && !signing.checking &&
+        this.files.length > 0 && !!signing.identityId;
+    },
+    planHintKey() {
+      if (this.files.length > 0 && this.signing.identityId && !this.signing.uploaded) {
+        return "signing.plan.rerun_needed";
+      }
+      return "signing.plan.pending";
+    },
+  },
+  watch: {
+    "signing.identityId"() {
+      this.runCheck();
+    },
+    "signing.allowMissingEntitlements"() {
+      this.runCheck();
+    },
+    "form.remove_extensions"() {
+      this.runCheck();
+    },
+    "form.custom_identifier"() {
+      this.runCheck();
+    },
+    "device.udid"() {
+      this.runCheck();
+    },
+  },
   created() {
     this.id = this.$route.params.id;
+    this.uploadSeq = 0;
+    this.checkSeq = 0;
+    this.reportStream = createSigningReportStream();
 
     this.fetchData();
   },
@@ -301,6 +584,10 @@ export default {
   unmounted() {
     this.closeWebSocket();
     this.stopUpdateLog();
+    // A running installation owns the uploaded IPA; otherwise drop it.
+    if (!this.loading) {
+      this.discardUploadedIpa();
+    }
   },
   methods: {
     fetchData() {
@@ -308,17 +595,191 @@ export default {
       api.getDevice(_this.id).then((res) => {
         _this.device = res.data;
       });
-      api.getAccounts().then((res) => {
+      const accounts = api.getAccounts().then((res) => {
         const m = res.data || {};
         _this.accounts = Object.keys(m).map((k) => m[k]);
       }).catch(() => {
         _this.accounts = [];
+      });
+      const identities = api.getSigningIdentities().then((res) => {
+        _this.signing.identities = res.data || [];
+        if (_this.signing.identities.length === 1 && !_this.signing.identityId) {
+          _this.signing.identityId = _this.signing.identities[0].id;
+        }
+      }).catch(() => {
+        _this.signing.identities = [];
       });
       api.getAppList().then((res) => {
         _this.installedApps = res.data || [];
       }).catch(() => {
         _this.installedApps = [];
       });
+      // Without any Apple account, default to the imported identities.
+      Promise.all([accounts, identities]).then(() => {
+        if (!_this.signing.modeChosen && _this.accounts.length === 0 &&
+          _this.signing.identities.length > 0) {
+          _this.applySigningMode(externalMode);
+        }
+      });
+    },
+    setSigningMode(mode) {
+      this.signing.modeChosen = true;
+      this.applySigningMode(mode);
+    },
+    applySigningMode(mode) {
+      if (this.loading || this.signing.mode === mode) {
+        return;
+      }
+      this.signing.mode = mode;
+      this.signing.check = null;
+      this.signing.checkError = null;
+      this.recommendedAccount = "";
+      this.recommendedIdentityId = 0;
+      if (mode === externalMode) {
+        // External signing only reads IPAs uploaded to this server.
+        if (this.installMode !== "file") {
+          this.toggleInstallMode();
+        }
+        this.prepareExternalIpa();
+      } else {
+        this.uploadSeq++;
+        this.signing.uploading = false;
+        this.discardUploadedIpa();
+      }
+    },
+    manageIdentities() {
+      this.$router.push({ name: "account", query: { section: "signing-identities" } });
+    },
+    formatDate(value) {
+      const date = dayjs(value);
+      return value && date.isValid() && date.year() > 1 ? date.format("YYYY-MM-DD") : "—";
+    },
+    codeText(code, message) {
+      return signingCodeText(code, message, (key) => this.$t(key));
+    },
+    classText(signingClass) {
+      const key = `signing.classes.${signingClass}`;
+      const text = this.$t(key);
+      return text !== key ? text : signingClass;
+    },
+    // prepareExternalIpa uploads the selected IPA, then checks it.
+    async prepareExternalIpa() {
+      if (!this.isExternal || this.installMode !== "file" || this.files.length === 0) {
+        return;
+      }
+      const file = this.files[0];
+      const seq = ++this.uploadSeq;
+      this.discardUploadedIpa();
+      this.signing.checkError = null;
+      this.signing.uploading = true;
+      try {
+        const formData = new FormData();
+        formData.append("files", file);
+        const data = await api.upload(formData);
+        if (seq !== this.uploadSeq) {
+          // Superseded by another file or by a mode change.
+          api.clean(data[0]).catch(() => {});
+          return;
+        }
+        this.signing.uploaded = data[0];
+      } catch (err) {
+        if (seq === this.uploadSeq) {
+          this.signing.checkError = requestErrorOf(err);
+        }
+        return;
+      } finally {
+        if (seq === this.uploadSeq) {
+          this.signing.uploading = false;
+        }
+      }
+      await this.runCheck();
+    },
+    discardUploadedIpa() {
+      const uploaded = this.signing.uploaded;
+      this.signing.uploaded = null;
+      this.signing.check = null;
+      if (uploaded) {
+        api.clean(uploaded).catch(() => {});
+      }
+    },
+    rerunCheck() {
+      if (this.signing.uploaded) {
+        this.runCheck();
+      } else {
+        this.prepareExternalIpa();
+      }
+    },
+    // runCheck asks the server for the signing plan of the current choices.
+    // The previous plan stays in place while the new one is computed so the
+    // entitlement waiver does not flicker; install stays disabled meanwhile.
+    async runCheck() {
+      if (!this.isExternal || this.loading) {
+        return;
+      }
+      const seq = ++this.checkSeq;
+      const signing = this.signing;
+      signing.checkError = null;
+      if (!signing.uploaded || !signing.identityId || !this.device.udid) {
+        signing.check = null;
+        signing.checking = false;
+        return;
+      }
+
+      signing.checking = true;
+      try {
+        const res = await api.checkSigningIdentity(signing.identityId, {
+          ipa_path: signing.uploaded.path,
+          udid: this.device.udid,
+          remove_extensions: this.form.remove_extensions,
+          allow_missing_entitlements: signing.allowMissingEntitlements,
+          custom_identifier: this.form.custom_identifier,
+        });
+        if (seq === this.checkSeq) {
+          signing.check = res.data || null;
+        }
+      } catch (err) {
+        if (seq === this.checkSeq) {
+          signing.check = null;
+          signing.checkError = requestErrorOf(err);
+        }
+      } finally {
+        if (seq === this.checkSeq) {
+          signing.checking = false;
+        }
+      }
+    },
+    resetSigningReport() {
+      this.reportStream = createSigningReportStream();
+      this.report.plan = null;
+      this.report.failure = null;
+      this.report.verified = false;
+    },
+    applySigningReport(report) {
+      switch (report.stage) {
+        case "plan":
+          this.report.plan = summarizePlan(report, report.blocking);
+          break;
+        case "failure":
+          this.report.failure = report;
+          break;
+        case "verified":
+          this.report.verified = true;
+          break;
+      }
+    },
+    appendStreamOutput(output) {
+      output.reports.forEach(this.applySigningReport);
+      this.log.newcontent += output.text;
+    },
+    // onInstallFinished runs once the stream reported the final result.
+    onInstallFinished() {
+      this.appendStreamOutput(this.reportStream.flush());
+      this.loading = false;
+      if (this.submittedMode === externalMode) {
+        // The server consumes the uploaded IPA; a request rejected before
+        // signing leaves it behind, so release it in every case.
+        this.discardUploadedIpa();
+      }
     },
     async onSubmit(e) {
       let _this = this;
@@ -326,9 +787,15 @@ export default {
       if (!_this.validateForm("#form")) {
         return;
       }
+      if (!_this.canInstall) {
+        return;
+      }
+      const external = _this.isExternal;
 
      
       _this.loading = true;
+      _this.submittedMode = _this.signing.mode;
+      _this.resetSigningReport();
       _this.log.output = "";
       _this.log.newcontent = "";
       _this.log.show = true;
@@ -348,7 +815,10 @@ export default {
         }
 
         let ipa;
-        if (_this.installMode === "file") {
+        if (external) {
+          ipa = _this.signing.uploaded;
+          _this.log.output += `IPA: ${ipa.name}\n`;
+        } else if (_this.installMode === "file") {
           let formData = new FormData();
           for (let i = 0; i < _this.files.length; i++) {
             let file = _this.files[i];
@@ -376,13 +846,17 @@ export default {
             device: _this.device.mac_addr,
             device_class: _this.device.device_class,
             udid: _this.device.udid,
-            account: _this.form.account,
-            password: _this.form.password,
+            account: external ? "" : _this.form.account,
+            password: external ? "" : _this.form.password,
             icon: _this.ipa.icon,
             bundle_identifier: _this.ipa.bundle_identifier,
             version: _this.ipa.version,
             custom_name: _this.form.custom_name.trim(),
             remove_extensions: _this.form.remove_extensions,
+            custom_identifier: external ? _this.form.custom_identifier : "",
+            signing_mode: _this.signing.mode,
+            signing_identity_id: external ? Number(_this.signing.identityId) : 0,
+            allow_missing_entitlements: external && _this.signing.allowMissingEntitlements,
         });
       } catch (error) {
         console.log(error);
@@ -406,6 +880,8 @@ export default {
     async onFileChange(e) {
       this.files = e.target.files;
       this.recommendedAccount = "";
+      this.recommendedIdentityId = 0;
+      this.discardUploadedIpa();
       if (this.files.length > 0) {
         const file = this.files[0];
         try {
@@ -422,22 +898,53 @@ export default {
 
             if (bundleId) {
               for (let app of this.installedApps) {
-                if (app.bundle_identifier === bundleId) {
-                  this.recommendedAccount = app.account;
-                  this.form.account = app.account;
-                  if (app.custom_name) {
-                    this.form.custom_name = app.custom_name;
-                  }
-                  break;
+                if (app.bundle_identifier !== bundleId) {
+                  continue;
                 }
+                if (this.isExternal) {
+                  if (this.recommendIdentity(app)) {
+                    break;
+                  }
+                  continue;
+                }
+                if (app.signing_mode === externalMode) {
+                  continue;
+                }
+                this.recommendedAccount = app.account;
+                this.form.account = app.account;
+                if (app.custom_name) {
+                  this.form.custom_name = app.custom_name;
+                }
+                break;
               }
-              if (this.recommendedAccount) break;
+              if (this.recommendedAccount || this.recommendedIdentityId) break;
             }
           }
         } catch (err) {
           console.error("Failed to read IPA bundle identifier:", err);
         }
       }
+      this.prepareExternalIpa();
+    },
+    // recommendIdentity preselects the identity that signed an earlier
+    // installation of the same app.
+    recommendIdentity(app) {
+      if (app.signing_mode !== externalMode) {
+        return false;
+      }
+      const identity = this.signing.identities.find((item) => item.id === app.signing_identity_id);
+      if (!identity) {
+        return false;
+      }
+      this.recommendedIdentityId = identity.id;
+      this.signing.identityId = identity.id;
+      if (app.custom_name) {
+        this.form.custom_name = app.custom_name;
+      }
+      if (app.custom_identifier) {
+        this.form.custom_identifier = app.custom_identifier;
+      }
+      return true;
     },
     validateForm(id) {
       let form = document.querySelector(id);
@@ -485,22 +992,23 @@ export default {
         return;
       }
 
-      // append new log content
-      _this.log.newcontent += line;
-
+      const output = _this.reportStream.push(line);
+      _this.appendStreamOutput(output);
 
       // Installation successful.
       if (line.indexOf("Installation Succeeded") !== -1) {
-        _this.loading = false;
+        _this.onInstallFinished();
         toast.success(this.$t("install.toast.install_success"));
         return;
       }
 
-
       // Installation error
       if (line.indexOf("Installation Failed") !== -1) {
-        _this.loading = false;
-        toast.error(_this.installFailureMessage());
+        _this.onInstallFinished();
+        const failure = _this.report.failure;
+        toast.error(failure
+          ? _this.codeText(failure.code, failure.message)
+          : _this.installFailureMessage());
         return;
       }
     },
@@ -671,6 +1179,7 @@ import RefreshIcon from "@/assets/icons/refresh.svg";
 import DownloadIcon from "@/assets/icons/download.svg";
 import FolderOpenIcon from "@/assets/icons/folder-open.svg";
 import LinkIcon from "@/assets/icons/link.svg";
+import SettingsIcon from "@/assets/icons/settings.svg";
 </script>
   
   <style scoped>
@@ -714,6 +1223,79 @@ import LinkIcon from "@/assets/icons/link.svg";
 .atv-install-page .join > .join-item.btn:last-child {
   border-start-end-radius: var(--rounded-btn, 0.5rem);
   border-end-end-radius: var(--rounded-btn, 0.5rem);
+}
+
+.atv-install-page .join > .join-item.btn:first-child {
+  border-start-start-radius: var(--rounded-btn, 0.5rem);
+  border-end-start-radius: var(--rounded-btn, 0.5rem);
+}
+
+.atv-install-signing-mode > .btn {
+  min-width: 0;
+  white-space: normal;
+  line-height: 1.2;
+}
+
+/* Compatibility plan of the external certificate mode, below the form. */
+.atv-install-plan,
+.atv-install-report {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--atv-border);
+  border-radius: 12px;
+  background: var(--atv-surface-alt);
+  min-width: 0;
+}
+
+.atv-install-report {
+  background: var(--atv-surface);
+}
+
+.atv-install-plan h5,
+.atv-install-report h5 {
+  margin: 0;
+  font-size: .95rem;
+  font-weight: 650;
+  color: var(--atv-ink);
+}
+
+.atv-install-plan-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.atv-install-plan-progress,
+.atv-install-plan-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: .86rem;
+  color: var(--atv-muted);
+}
+
+.atv-install-plan-error {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--atv-danger);
+  border-radius: 10px;
+  background: var(--atv-danger-soft);
+  color: var(--atv-ink);
+  font-size: .86rem;
+  overflow-wrap: anywhere;
+}
+
+.atv-install-report summary {
+  cursor: pointer;
+  font-size: .86rem;
+  color: var(--atv-muted);
 }
 
 /* Screenshot action sits on the device icon's bottom-right corner,
